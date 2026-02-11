@@ -53,6 +53,21 @@ magicbrain evolve --genome "30121033102301230112332100123" --generations 10 --po
 
 # Train with live diagnostics monitoring
 magicbrain monitor --genome "30121033102301230112332100123" --steps 10000 --metrics metrics.json
+
+# NeuroGenesis Engine: compile dataset into genome
+magicbrain neurogenesis compile --text /path/to/text.txt --strategy statistical
+
+# NeuroGenesis: full pipeline (compile → develop → train → reconstruct)
+magicbrain neurogenesis run --text /path/to/text.txt --strategy statistical --steps 10000 --out model.npz
+
+# NeuroGenesis: full pipeline with CPPN weight generation
+magicbrain neurogenesis run --text /path/to/text.txt --cppn --steps 10000
+
+# NeuroGenesis: benchmark strategies against baselines
+magicbrain neurogenesis benchmark --text /path/to/text.txt --steps 5000 --trials 3
+
+# NeuroGenesis: discover attractors in trained model
+magicbrain neurogenesis attractors --model model.npz --probes 500
 ```
 
 ### Testing
@@ -78,6 +93,9 @@ pytest tests/platform/
 
 # Run hybrid tests only
 pytest tests/hybrid/
+
+# Run neurogenesis tests only
+pytest tests/neurogenesis/
 ```
 
 Test configuration is in `pyproject.toml` under `[tool.pytest.ini_options]`. Tests are collected from `tests/` directory.
@@ -112,11 +130,12 @@ magicbrain/
 ├── sampling.py              - Text generation (temperature, top-k, top-p)
 ├── io.py                    - Save/load models (.npz format)
 ├── utils.py                 - Utilities (softmax, sigmoid, sparsify_topm)
-├── cli.py                   - CLI: train, sample, repair, evolve, monitor
+├── cli.py                   - CLI: train, sample, repair, evolve, monitor, neurogenesis
 │
 ├── tasks/
 │   ├── text_task.py         - Vocab building and training loop
-│   └── self_repair.py       - Self-repair benchmark after edge damage
+│   ├── self_repair.py       - Self-repair benchmark after edge damage
+│   └── neurogenesis_task.py - NeuroGenesis E2E pipeline & benchmark
 │
 ├── architectures/
 │   └── hierarchical_brain.py - Multi-layer hierarchical SNN
@@ -167,6 +186,17 @@ magicbrain/
 │   ├── cnn/vision_model.py  - Torchvision adapter
 │   └── transformers/hf_model.py - Hugging Face adapter
 │
+├── neurogenesis/               - NeuroGenesis Engine (neurogenomic memory)
+│   ├── __init__.py             - Public API
+│   ├── compiler.py             - GenomeCompiler: dataset → genome (hash/statistical/hybrid)
+│   ├── energy.py               - Hopfield energy E(s,W) & gradient computation
+│   ├── attractor_dynamics.py   - Continuous dynamics converging to attractors
+│   ├── cppn.py                 - CPPN: spatial coordinates → synaptic weights
+│   ├── development.py          - Development operator: genome → 3D neural tissue
+│   ├── pattern_memory.py       - Hopfield memory with Storkey learning rule
+│   ├── reconstruction.py       - Attractor/autoregressive data reconstruction
+│   └── genome_v2.py            - Extended genome format (72+ positions)
+│
 ├── integration/
 │   ├── knowledgebase_client.py - External KnowledgeBase API client
 │   └── neural_digital_twin.py  - Brain state modeling (digital twin)
@@ -186,7 +216,7 @@ api/                         - FastAPI REST microservice
 │   └── core/config.py       - Settings
 └── tests/test_api.py        - API tests
 
-tests/                       - Test suite (~57 tests)
+tests/                       - Test suite (~150 tests)
 ├── test_smoke.py            - Core SNN sanity tests
 ├── test_backends.py         - Backend implementations
 ├── test_evolution.py        - Genome evolution & GA
@@ -204,6 +234,14 @@ tests/                       - Test suite (~57 tests)
 ├── hybrid/                  - Hybrid architecture tests
 │   ├── test_hybrid_architectures.py
 │   └── test_builder.py
+├── neurogenesis/            - NeuroGenesis Engine tests (93 tests)
+│   ├── test_compiler.py
+│   ├── test_energy.py
+│   ├── test_cppn.py
+│   ├── test_development.py
+│   ├── test_pattern_memory.py
+│   ├── test_reconstruction.py
+│   └── test_genome_v2.py
 └── integration/
     └── test_knowledgebase_api.py
 
@@ -332,7 +370,64 @@ hybrid = (HybridBuilder()
 
 Attention mechanism operating in the spike domain for SNN+Transformer hybrids.
 
-### Layer 5: Integration & Services
+### Layer 5: NeuroGenesis Engine (Neurogenomic Memory)
+
+Core thesis: **data is not stored directly — a compact generative program (genome) is stored that can reproduce data through dynamic neural structure activation.**
+
+Pipeline: `Dataset → Compile → Genome → Develop → Train → Reconstruct`
+
+#### GenomeCompiler (`neurogenesis/compiler.py`)
+
+Compiles datasets into deterministic base-4 genomes. Three strategies:
+- **hash**: SHA-256(data) → base-4 (pseudorandom baseline)
+- **statistical**: data statistics (entropy, vocab, repetitiveness) → informed genome positions
+- **hybrid**: statistics for architecture params (N, K, p_long), hash for the rest
+
+`analyze_dataset()` extracts: size, vocab_size, entropy, repetitiveness, ngram concentration.
+
+#### Energy Function (`neurogenesis/energy.py`)
+
+Hopfield-style energy: `E(s) = -½ sᵀWs - θᵀs + λ||s||₁`
+
+Supports both dense (N×N) and sparse (edge-list) weight formats. Provides energy gradient, local field computation, stability checking, and basin profiling.
+
+#### Attractor Dynamics (`neurogenesis/attractor_dynamics.py`)
+
+Continuous neural dynamics converging to attractor states via energy minimization:
+- `step()`: `s_{t+1} = momentum * s_t + (1-momentum) * σ(W·s_t/τ + θ)`
+- `converge()`: iterate until `||s_{t+1} - s_t|| < tolerance`
+- `find_attractors()`: probe from N random states, cluster results
+
+Key difference from TextBrain's hard top-k: uses continuous sigmoid activation for smooth convergence.
+
+#### CPPN (`neurogenesis/cppn.py`)
+
+Compositional Pattern-Producing Network: generates synaptic weights as a function of neuron spatial coordinates: `w_ij = CPPN(pos_i, pos_j, dist_ij, type_i, type_j)`. Architecture (layers, widths, activation functions) is encoded in the genome. 8 basis functions: sin, cos, gaussian, sigmoid, tanh, abs, identity, step.
+
+#### Development Operator (`neurogenesis/development.py`)
+
+Three-stage "morphogenesis":
+1. **Morphogenesis**: 3D positions + KNN connectivity (reuses `graph.py`)
+2. **Synaptogenesis**: CPPN generates spatially-patterned weights (or random fallback)
+3. **Maturation**: threshold calibration based on incoming weight statistics
+
+#### Pattern Memory (`neurogenesis/pattern_memory.py`)
+
+Hopfield-style associative memory with **Storkey learning rule** (capacity ~0.14N patterns). Uses bipolar (-1/+1) encoding internally, 0/1 externally. `text_to_pattern()` converts token sequences to sparse neural patterns. `recall()` converges from noisy/partial cues to stored patterns via tanh dynamics.
+
+#### Reconstruction Operator (`neurogenesis/reconstruction.py`)
+
+Multiple reconstruction modes:
+- **Autoregressive**: standard next-token sampling from trained TextBrain
+- **Attractor decoding**: find attractors → decode each via readout matrix R
+- **Cue-based recall**: prime with partial text → generate continuation
+- **Fidelity metrics**: char_accuracy, bigram/trigram overlap, vocab overlap
+
+#### Extended Genome v2 (`neurogenesis/genome_v2.py`)
+
+Backward-compatible extension: `[Topology 0-23][CPPN 24-55][Attractor 56-71][Patterns 72+]`. Standard genomes (24-28 chars) decode identically. Extended genomes add CPPN architecture params (layers, widths, activations), attractor dynamics config (tau, momentum, tolerance), and pattern seeds.
+
+### Layer 6: Integration & Services
 
 #### REST API (`api/`)
 
@@ -395,6 +490,36 @@ Model files (`.npz`) contain:
 1. Use `HybridBuilder` for custom combinations, or
 2. Subclass `HybridArchitecture` from `magicbrain.hybrid.base`
 3. Add tests in `tests/hybrid/`
+
+### Using the NeuroGenesis Engine
+
+```python
+from magicbrain.neurogenesis import GenomeCompiler, DevelopmentOperator, AttractorDynamics
+from magicbrain.neurogenesis import ReconstructionOperator, PatternMemory
+
+# 1. Compile dataset into genome
+compiler = GenomeCompiler()
+genome = compiler.compile("your text data here", strategy="statistical")
+
+# 2. Develop neural tissue with CPPN
+dev = DevelopmentOperator()
+brain, tissue = dev.develop_and_build_brain(genome, vocab_size=50, use_cppn=True)
+
+# 3. Full pipeline (compile → develop → train → reconstruct → evaluate)
+from magicbrain.tasks.neurogenesis_task import run_neurogenesis_pipeline
+result = run_neurogenesis_pipeline("your data", strategy="statistical", steps=10000)
+print(result.fidelity, result.compression)
+
+# 4. Pattern memory (Hopfield-style)
+mem = PatternMemory(N=256, sparsity=0.1)
+pattern = mem.text_to_pattern([1, 2, 3], vocab_size=50)
+mem.imprint_pattern(pattern)
+recall = mem.recall(noisy_cue)
+
+# 5. Attractor analysis of trained model
+dynamics = AttractorDynamics(tau=0.3)
+attractors = dynamics.find_attractors(brain.N, W_dense, brain.theta, n_probes=500)
+```
 
 ### Modifying core architecture
 
